@@ -11,9 +11,10 @@ use crate::{
             frames::Frames,
             identity::Identity,
             other::Features,
-            set_window::SetWindowFunction,
+            set_window::{ScanMode, SetWindowFunction},
         },
         cdbs::Inquiry,
+        model::Model,
         sense::{Fault, Outcome, interpret},
     },
     transport::{Data, Transport},
@@ -136,11 +137,17 @@ pub async fn capabilities(t: &mut dyn Transport) -> Result<Capabilities, Error> 
         _ => None,
     };
 
+    // The LS-50 firmware runs multi-reading (tested at 2 to 16 readings), but byte 5 of the page leaves it out
+    let mut set_window = SetWindowFunction::try_from(&vpd(t, SetWindowFunction::PAGE_CODE).await?)?;
+    if identity.model() == Some(Model::Ls50) {
+        set_window.mode |= ScanMode::MULTI_READING;
+    }
+
     Ok(Capabilities {
         identity,
         address,
         features,
-        set_window: SetWindowFunction::try_from(&vpd(t, SetWindowFunction::PAGE_CODE).await?)?,
+        set_window,
         // Neither spec lists this one in page 00h, so a refusal means the unit
         // has not got it rather than that anything went wrong
         ccd: match vpd(t, CcdMeasurement::PAGE_CODE).await {
