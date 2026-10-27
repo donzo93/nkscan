@@ -511,10 +511,11 @@ impl Session {
             let record = Box::pin(self.cooperation()).await?;
             debug!(?coop, ?record, "the unit wants something doing");
 
-            // Each job is asked for once, so the same one coming back means it
-            // is not satisfied by reading the record and re-issuing, and asking
-            // again would spin until the cap
-            if asked.contains(&(coop, record.clone())) {
+            // The same job straight back means reading the record and re-issuing
+            // did not satisfy it. After a different one it is fair: the LS-50 asks
+            // Averaging, Truncate, Averaging, as truncation clears its averaging
+            // flag, and the cap still ends a loop
+            if asked.last() == Some(&(coop, record.clone())) {
                 return Err(Error::Unsupported {
                     op: "host cooperation",
                     reason: format!("the unit asked for {coop:?} twice over"),
