@@ -352,7 +352,10 @@ pub fn validate_set(windows: &[Window]) -> Result<(), Error> {
         )
     })?;
     let visible = windows.iter().filter(|w| w.channel().is_color()).count();
-    if planes != visible {
+    // Infrared alone is one plane with the monochrome code: the LS-50's SCAN
+    // takes a single window only with composition 02h (0x2230c)
+    let infrared_alone = windows.len() == 1 && first.channel() == Channel::Infrared;
+    if planes != visible && !(infrared_alone && planes == 1) {
         return Err(bad(
             "image composition",
             format!(
@@ -994,6 +997,15 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    /// Infrared alone is one plane, and the LS-50 scans it only under the
+    /// monochrome code
+    #[test]
+    fn infrared_alone_is_one_monochrome_plane() {
+        let ir = Channel::Infrared.id();
+        assert!(validate_set(&set(&[ir], Composition::MultilevelBW)).is_ok());
+        assert!(validate_set(&set(&[ir], Composition::MultilevelRGB)).is_err());
     }
 
     /// Address publishes a separate resolution range for thumbnails, far below the

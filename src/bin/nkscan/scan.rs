@@ -10,9 +10,14 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use nkscan::{
     device,
     error::Error,
-    protocol::decode::Samples,
+    protocol::{
+        data::Rect,
+        decode::Samples,
+        window::{Channel, Composition},
+    },
     scan::{
         autoexpose::Exposures,
+        clean::clean_frame,
         focus::Focus,
         frame::{self, Phase},
         framing::{self, Framing},
@@ -126,6 +131,7 @@ async fn run_cancellable(session: &mut Session, args: cli::Scan) -> anyhow::Resu
         thumbnail: save_thumbnail,
         format,
         film,
+        ir_pass,
     } = args;
 
     // Silver grains stop infrared as they stop light, so the mask a
@@ -170,6 +176,12 @@ async fn run_cancellable(session: &mut Session, args: cli::Scan) -> anyhow::Resu
     // the thumbnail pass and the stage move that would otherwise come first
     recipe.supported(session.capabilities())?;
     let hold_white_balance = hold_white_balance(film, unlock_wb, lock_wb);
+
+    // Infrared in a pass of its own, see scan_split
+    let split = ir_pass && recipe.samples > 1 && recipe.infrared;
+    if ir_pass && !split {
+        warn!("--ir-pass needs --samples above 1 and --ir or --clean, so it is ignored");
+    }
 
     // State for the first frame's exposures, reused for the rest so a strip comes out consistent rather than per-frame optimal
     let mut locked: Option<Exposures> = None;
@@ -292,53 +304,66 @@ async fn run_cancellable(session: &mut Session, args: cli::Scan) -> anyhow::Resu
                 clean,
                 focus: Focus::default(),
             };
-            let scanned = frame::scan_frame_with(
-                session,
-                &recipe,
-                frame,
-                options,
-                &mut samples,
-                |phase, p| {
-                    match phase {
-                        Phase::Meter(pass) => {
-                            // A pass does not know how long it is until its
-                            // first chunk lands, so a bar made when the phase
-                            // starts draws `0 B/0 B` and sits at it. Waiting for
-                            // a length keeps that line off the screen, and names
-                            // the bar for the pass it is rather than renaming it
-                            if meter_bar.is_none() && p.total > 0 {
-                                meter_bar = Some(pass_bar(format!("meter {pass}"), p.total));
-                                shown = pass;
-                            }
-                            if let Some(bar) = &meter_bar {
-                                // Each pass starts over, so say which one it is
-                                if pass != shown {
-                                    bar.set_message(format!("meter {pass}"));
+            let scanned = if split {
+                scan_split(
+                    session,
+                    &recipe,
+                    frame,
+                    metering,
+                    locked.as_ref(),
+                    clean,
+                    &mut samples,
+                )
+                .await?
+            } else {
+                frame::scan_frame_with(
+                    session,
+                    &recipe,
+                    frame,
+                    options,
+                    &mut samples,
+                    |phase, p| {
+                        match phase {
+                            Phase::Meter(pass) => {
+                                // A pass does not know how long it is until its
+                                // first chunk lands, so a bar made when the phase
+                                // starts draws `0 B/0 B` and sits at it. Waiting for
+                                // a length keeps that line off the screen, and names
+                                // the bar for the pass it is rather than renaming it
+                                if meter_bar.is_none() && p.total > 0 {
+                                    meter_bar = Some(pass_bar(format!("meter {pass}"), p.total));
                                     shown = pass;
                                 }
-                                bar.report(p);
+                                if let Some(bar) = &meter_bar {
+                                    // Each pass starts over, so say which one it is
+                                    if pass != shown {
+                                        bar.set_message(format!("meter {pass}"));
+                                        shown = pass;
+                                    }
+                                    bar.report(p);
+                                }
+                            }
+                            Phase::Scan => {
+                                if let Some(bar) = meter_bar.take() {
+                                    crate::progress::done(bar);
+                                }
+                                if scan_bar.is_none() && p.total > 0 {
+                                    scan_bar = Some(pass_bar(format!("frame {}", n + 1), p.total));
+                                }
+                                if let Some(bar) = &scan_bar {
+                                    bar.report(p);
+                                }
                             }
                         }
-                        Phase::Scan => {
-                            if let Some(bar) = meter_bar.take() {
-                                crate::progress::done(bar);
-                            }
-                            if scan_bar.is_none() && p.total > 0 {
-                                scan_bar = Some(pass_bar(format!("frame {}", n + 1), p.total));
-                            }
-                            if let Some(bar) = &scan_bar {
-                                bar.report(p);
-                            }
+                        if cancel::requested() {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
                         }
-                    }
-                    if cancel::requested() {
-                        ControlFlow::Break(())
-                    } else {
-                        ControlFlow::Continue(())
-                    }
-                },
-            )
-            .await?;
+                    },
+                )
+                .await?
+            };
             if let Some(bar) = meter_bar {
                 crate::progress::done(bar);
             }
@@ -440,6 +465,133 @@ async fn run_cancellable(session: &mut Session, args: cli::Scan) -> anyhow::Resu
         wait_for_film(session, prompt, cartridge).await?;
     }
     Ok(())
+}
+
+/// Scan a frame with infrared in a pass of its own, for --ir-pass
+///
+/// The LS-50 reads every window on every reading, infrared included, and
+/// infrared takes by far the longest exposure (about twice red, green and blue
+/// together). Multi-sampling with infrared therefore costs about three times
+/// the colors alone, where the LS-5000 reads infrared once. This gets the
+/// LS-5000's cost back in one session, so the film does not move between passes:
+///
+/// 1. the colors at `recipe.samples` readings, focusing first;
+/// 2. infrared alone, one reading, lens held. The LS-50's SCAN handler takes
+///    a list of one window (0x22114-0x2232c) when that window reads once and
+///    its image composition (byte 25) is 02h, monochrome. If the unit refuses
+///    it anyway, the pass is taken with the colors at one reading instead, and
+///    only its infrared kept.
+///
+/// Both passes use the same exposures: `locked` if given, otherwise metered
+/// once here with infrared. The infrared plane is put into `samples`, next to
+/// the colors, and dust removal runs on the pair if `clean` is set.
+async fn scan_split(
+    session: &mut Session,
+    recipe: &Recipe,
+    frame: Rect,
+    metering: Metering,
+    locked: Option<&Exposures>,
+    clean: bool,
+    samples: &mut Samples,
+) -> anyhow::Result<frame::Scanned> {
+    let go = || {
+        if cancel::requested() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let with_ir = Recipe {
+        infrared: true,
+        ..*recipe
+    };
+    let exposures = match locked {
+        Some(e) => e.clone(),
+        None => frame::meter_frame_with(session, &with_ir, frame, &metering, |_, _| go()).await?,
+    };
+
+    // Pass 1: colors, all the readings, focusing first
+    let color_recipe = Recipe {
+        infrared: false,
+        ..*recipe
+    };
+    let mut scanned = frame::scan_frame_with(
+        session,
+        &color_recipe,
+        frame,
+        frame::Options {
+            exposures: Some(&exposures),
+            metering,
+            clean: false,
+            focus: Focus::default(),
+        },
+        samples,
+        |_, _| go(),
+    )
+    .await?;
+    info!(readings = recipe.samples, "color pass done");
+
+    // Pass 2: infrared alone, one reading, lens where pass 1 left it
+    let ir_recipe = Recipe {
+        samples: 1,
+        ..with_ir
+    };
+    let mut windows = ir_recipe.windows(session.capabilities(), frame)?;
+    windows.retain(|w| w.channel() == Channel::Infrared);
+    // One window has to say one plane: SCAN refuses a single window unless its
+    // byte 25 is 02h (0x2230c), where the RGB code the set used gives 05h-26h-02h
+    for w in &mut windows {
+        w.composition = Composition::MultilevelBW;
+    }
+    exposures.apply(&mut windows);
+    let mut ir_samples = Samples::default();
+    let ir_shape = match session
+        .scan_pass_with(&windows, Duration::from_secs(1800), &mut ir_samples, |_| {
+            go()
+        })
+        .await
+    {
+        Ok(pass) => {
+            ir_samples.to_full_scale(pass.layout.bits_per_sample);
+            info!("infrared pass done, infrared alone");
+            (pass.rows, pass.cols)
+        }
+        Err(e) => {
+            warn!(%e, "the unit would not scan infrared alone, taking it with the colors at one reading");
+            let ir_scan = frame::scan_frame_with(
+                session,
+                &ir_recipe,
+                frame,
+                frame::Options {
+                    exposures: Some(&exposures),
+                    metering,
+                    clean: false,
+                    focus: Focus::Hold,
+                },
+                &mut ir_samples,
+                |_, _| go(),
+            )
+            .await?;
+            (ir_scan.pass.rows, ir_scan.pass.cols)
+        }
+    };
+
+    if ir_shape != (scanned.pass.rows, scanned.pass.cols) {
+        bail!(
+            "the infrared pass is {}x{} and the color pass {}x{}, so they cannot be paired",
+            ir_shape.0,
+            ir_shape.1,
+            scanned.pass.rows,
+            scanned.pass.cols
+        );
+    }
+    samples.ir = ir_samples.ir.take();
+    scanned.exposures = exposures;
+    if clean {
+        let model = session.capabilities().identity.model();
+        scanned.cleaned = Some(clean_frame(samples, &scanned.pass, model)?);
+    }
+    Ok(scanned)
 }
 
 /// Whether to meter the channels as one group, from the film type and whatever
