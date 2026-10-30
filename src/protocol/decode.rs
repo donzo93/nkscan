@@ -226,12 +226,19 @@ impl Slot {
     }
 
     /// One per output channel, in the order the channel list carries them
-    fn every(channels: &[u8], readings: usize) -> Vec<Self> {
+    ///
+    /// `infrared_every_reading` repeats infrared with the colors, so a reading
+    /// is every channel and the stride is all of them
+    fn every(channels: &[u8], readings: usize, infrared_every_reading: bool) -> Vec<Self> {
         let colors = channels
             .iter()
             .filter(|id| Channel::from(**id).is_color())
             .count();
         let once = channels.len() - colors;
+        let stride = match infrared_every_reading {
+            true => channels.len(),
+            false => colors,
+        };
 
         let (mut color, mut ir) = (0, 0);
         channels
@@ -242,7 +249,7 @@ impl Slot {
                     Slot {
                         first: color - 1,
                         next: colors + once + color - 1,
-                        stride: colors,
+                        stride,
                         readings,
                         out: color - 1,
                         color: true,
@@ -250,13 +257,23 @@ impl Slot {
                 }
                 false => {
                     ir += 1;
-                    Slot {
-                        first: colors + ir - 1,
-                        next: 0,
-                        stride: 0,
-                        readings: 1,
-                        out: ir - 1,
-                        color: false,
+                    match infrared_every_reading {
+                        true => Slot {
+                            first: colors + ir - 1,
+                            next: channels.len() + colors + ir - 1,
+                            stride,
+                            readings,
+                            out: ir - 1,
+                            color: false,
+                        },
+                        false => Slot {
+                            first: colors + ir - 1,
+                            next: 0,
+                            stride: 0,
+                            readings: 1,
+                            out: ir - 1,
+                            color: false,
+                        },
                     }
                 }
             })
@@ -416,6 +433,7 @@ impl<'a> Decoder<'a> {
         let slots = Slot::every(
             &layout.channels,
             usize::from(layout.readings_per_line).max(1),
+            layout.infrared_every_reading,
         );
         let colors = slots.iter().filter(|s| s.color).count();
         let ir = slots.len() - colors;
@@ -767,6 +785,7 @@ mod transposed {
             channels,
             interleaving: ColorInterleaving::MULTILINE_SIMULTANEOUS,
             readings_per_line: readings,
+            infrared_every_reading: false,
             ccd_lines: 3,
             packed_rows: 1,
             registration_gap: gap,
@@ -895,6 +914,7 @@ mod transposed {
             channels,
             interleaving: ColorInterleaving::LINE_WITHOUT_DISTANCE,
             readings_per_line: readings,
+            infrared_every_reading: false,
             ccd_lines: 1,
             packed_rows: 1,
             registration_gap: 1,
