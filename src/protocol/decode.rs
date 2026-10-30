@@ -964,6 +964,50 @@ mod transposed {
         }
     }
 
+    /// The LS-50 reads infrared again with the colors, so a feed position is
+    /// R, G, B, IR for each reading and infrared averages like a color
+    #[test]
+    fn a_single_line_averages_infrared_read_every_time() {
+        let (rows, stages, readings) = (2usize, 2usize, 4u8);
+        let l = Layout {
+            infrared_every_reading: true,
+            ..single(rows as u32, stages as u32, vec![1, 2, 3, 9], readings)
+        };
+        // 4 channels x 4 readings
+        assert_eq!(l.readouts(), 16);
+        let (mut d, mut samples) = buffers(&l);
+        d.push(&stream(stages, 16, rows, 1), &mut samples).unwrap();
+        assert!(d.complete());
+
+        // Channel `slot` of each reading sits 4 readouts after the last
+        let average = |stage: usize, slot: usize, pixel: usize| {
+            let sum: u32 = (0..4)
+                .map(|r| u32::from(tag(stage, slot + 4 * r, pixel, 0)))
+                .sum();
+            (sum / 4) as u16
+        };
+        let (_, cols) = d.shape();
+        let ir = samples.ir.as_ref().unwrap();
+        for stage in 0..stages {
+            for pixel in 0..rows {
+                let (y, x) = (rows - 1 - pixel, stage);
+                let pixel_at = y * cols + x;
+                assert_eq!(
+                    ir[pixel_at],
+                    average(stage, 3, pixel),
+                    "stage {stage} pixel {pixel} IR"
+                );
+                for c in 0..3 {
+                    assert_eq!(
+                        samples.colors[c][pixel_at],
+                        average(stage, c, pixel),
+                        "stage {stage} pixel {pixel} color {c}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A single-line pass of a channel multi-sampling does not repeat is one
     /// exposure per feed position, however many readings the window asked for.
     /// An infrared-only scan carries no color channel at all

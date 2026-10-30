@@ -879,6 +879,40 @@ mod tests {
         );
     }
 
+    /// The LS-50 reads infrared again on every reading, so the readings of a
+    /// line are all the same length
+    ///
+    /// Each reading is R, G, B, IR, and the unit pads it by 304 to a whole
+    /// number of 512-byte packets
+    #[test]
+    fn an_ls50_reads_infrared_on_every_reading() {
+        let truncation = Truncation {
+            position: Position::ALL_LAST,
+            all_colors: Edges {
+                first: 0,
+                last: 304,
+            },
+            ..Default::default()
+        };
+        let mut windows = rgb(4000, (986, 1000));
+        windows.push(window(9, 4000, (986, 1000)));
+        for w in &mut windows {
+            w.multiple_reading = 1;
+            w.composition = Composition::MultilevelRGB;
+        }
+        let mut ls50 = caps(0x03, 1, 1);
+        ls50.identity.product = "LS-50 ED".into();
+
+        let l = Layout::new(&ls50, &windows, 4000, Some(&truncation)).unwrap();
+
+        assert!(l.infrared_every_reading);
+        assert!(l.even_readings());
+        assert_eq!(l.bytes_per_reading(0), 8192);
+        assert_eq!(l.bytes_per_reading(1), 8192);
+        assert_eq!(l.bytes_per_line(), 16384);
+        assert_eq!(l.readouts(), 8);
+    }
+
     /// Issue 52: the same unit on `--samples 4 --ir`, where the CCD's two rows
     /// come packed into one line
     ///
