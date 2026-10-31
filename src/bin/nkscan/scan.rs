@@ -14,7 +14,7 @@ use nkscan::{
     scan::{
         autoexpose::Exposures,
         focus::Focus,
-        frame::{self, Phase},
+        frame::{self, InfraredPass, Phase},
         framing::{self, Framing},
         meter::Metering,
         pass::Progress,
@@ -285,6 +285,7 @@ async fn run_cancellable(session: &mut Session, args: cli::Scan) -> anyhow::Resu
                 metering,
                 clean,
                 focus: Focus::default(),
+                infrared: InfraredPass::WithColors,
             };
             let scanned = frame::scan_frame_with(
                 session,
@@ -562,6 +563,7 @@ struct FrameBars {
     frame: usize,
     meter: Option<ProgressBar>,
     scan: Option<ProgressBar>,
+    infrared: Option<ProgressBar>,
     /// The metering pass the meter bar is named for
     shown: usize,
 }
@@ -572,6 +574,7 @@ impl FrameBars {
             frame,
             meter: None,
             scan: None,
+            infrared: None,
             shown: 0,
         }
     }
@@ -609,6 +612,17 @@ impl FrameBars {
                     bar.report(p);
                 }
             }
+            Phase::Infrared => {
+                if let Some(bar) = self.scan.take() {
+                    crate::progress::done(bar);
+                }
+                if self.infrared.is_none() && p.total > 0 {
+                    self.infrared = Some(pass_bar(format!("IR {}", self.frame), p.total));
+                }
+                if let Some(bar) = &self.infrared {
+                    bar.report(p);
+                }
+            }
         }
         if cancel::requested() {
             ControlFlow::Break(())
@@ -619,7 +633,7 @@ impl FrameBars {
 
     /// Finish the bars that were drawn
     fn done(self) {
-        for bar in [self.meter, self.scan].into_iter().flatten() {
+        for bar in [self.meter, self.scan, self.infrared].into_iter().flatten() {
             crate::progress::done(bar);
         }
     }
